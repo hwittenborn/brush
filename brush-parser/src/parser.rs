@@ -139,9 +139,6 @@ pub fn parse_tokens(
     parse_result_to_error(parse_result, tokens)
 }
 
-/// Converts PEG parser results to application-specific error types.
-/// This function handles both successful parsing and error conversion,
-/// providing proper error context from token positions.
 fn parse_result_to_error<R>(
     parse_result: Result<R, peg::error::ParseError<usize>>,
     tokens: &Vec<Token>,
@@ -156,7 +153,6 @@ where
         }
         Err(parse_error) => {
             tracing::debug!(target: "parse", "Parse error: {:?}", parse_error);
-            // Convert PEG's token-index-based errors to source-position-based errors
             Err(error::convert_peg_parse_error(
                 &parse_error,
                 tokens.as_slice(),
@@ -167,8 +163,6 @@ where
     result
 }
 
-/// Implementation of PEG's Parse trait for token sequences.
-/// This allows the PEG parser to treat our token vector as a parseable input stream.
 impl peg::Parse for Tokens<'_> {
     type PositionRepr = usize;
 
@@ -188,8 +182,6 @@ impl peg::Parse for Tokens<'_> {
     }
 }
 
-/// Implementation of PEG's ParseElem trait for individual token parsing.
-/// This allows the PEG parser to consume individual tokens from the token stream.
 impl<'a> peg::ParseElem<'a> for Tokens<'a> {
     type Element = &'a Token;
 
@@ -202,9 +194,6 @@ impl<'a> peg::ParseElem<'a> for Tokens<'a> {
     }
 }
 
-/// Implementation of PEG's ParseSlice trait for token slice reconstruction.
-/// This rebuilds source text from a slice of tokens, useful for error reporting
-/// and when the parser needs to see the original text of a token sequence.
 impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
     type Slice = String;
 
@@ -219,7 +208,7 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
                     last_token_was_word = false;
                 }
                 Token::Word(s, _) => {
-                    // Insert spaces between adjacent words to maintain shell syntax
+                    // Place spaces between adjacent words.
                     if last_token_was_word {
                         result.push(' ');
                     }
@@ -241,30 +230,15 @@ pub struct SourceInfo {
     pub source: String,
 }
 
-// Core PEG grammar parser for shell syntax.
-// 
-// This grammar implements the POSIX shell syntax with bash extensions.
-// The grammar follows the shell syntax hierarchy:
-// program -> complete_commands -> and_or_lists -> pipelines -> commands
-// 
-// Key references:
-// - POSIX Shell Grammar: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html
-// - Bash Manual: https://www.gnu.org/software/bash/manual/bash.html#Shell-Syntax
-// - Bash Parser Analysis: https://mywiki.wooledge.org/BashParser
 peg::parser! {
     grammar token_parser<'a>(parser_options: &ParserOptions, source_info: &SourceInfo) for Tokens<'a> {
-        /// Top-level rule: parses a complete shell program
-        /// A program consists of optional leading whitespace, complete commands, and trailing whitespace
         pub(crate) rule program() -> ast::Program =
             linebreak() c:complete_commands() linebreak() { ast::Program { complete_commands: c } } /
             linebreak() { ast::Program { complete_commands: vec![] } }
 
-        /// Parses multiple complete commands separated by newlines
         rule complete_commands() -> Vec<ast::CompleteCommand> =
             c:complete_command() ++ newline_list()
 
-        /// Parses a complete command: and_or lists separated by ; or & operators
-        /// Examples: "cmd1 && cmd2; cmd3 &" 
         rule complete_command() -> ast::CompleteCommand =
             first:and_or() remainder:(s:separator_op() l:and_or() { (s, l) })* last_sep:separator_op()? {
                 let mut and_ors = vec![first];
@@ -275,7 +249,7 @@ peg::parser! {
                     and_ors.push(ao);
                 }
 
-                // Default to synchronous execution if no separator is given
+                // N.B. We default to synchronous if no separator op is given.
                 seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
 
                 let mut items = vec![];
@@ -286,27 +260,19 @@ peg::parser! {
                 ast::CompoundList(items)
             }
 
-        /// Parses and_or expressions: pipelines connected by && or || operators
-        /// Examples: "cmd1 && cmd2 || cmd3"
         rule and_or() -> ast::AndOrList =
             first:pipeline() additional:_and_or_item()* { ast::AndOrList { first, additional } }
 
-        /// Helper rule for additional and_or items beyond the first
         rule _and_or_item() -> ast::AndOr =
             op:_and_or_op() linebreak() p:pipeline() { op(p) }
 
-        /// Parses && and || operators, returning a constructor function
         rule _and_or_op() -> fn(ast::Pipeline) -> ast::AndOr =
             specific_operator("&&") { ast::AndOr::And } /
             specific_operator("||") { ast::AndOr::Or }
 
-        /// Parses a pipeline: optionally timed and/or negated sequence of commands connected by pipes
-        /// Examples: "time ! cmd1 | cmd2 | cmd3"
         rule pipeline() -> ast::Pipeline =
             timed:pipeline_timed()? bang:bang()? seq:pipe_sequence() { ast::Pipeline { timed, bang: bang.is_some(), seq } }
 
-        /// Parses timing specification for pipelines (bash extension)
-        /// Examples: "time cmd", "time -p cmd"  
         rule pipeline_timed() -> ast::PipelineTimed =
             non_posix_extensions_enabled() specific_word("time") posix_output:specific_word("-p")? {
                 if posix_output.is_some() {
