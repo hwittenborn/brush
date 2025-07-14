@@ -173,21 +173,33 @@ pub(crate) struct Tokens<'a> {
     pub tokens: &'a [Token],
 }
 
+/// Tracks the current quoting mode during tokenization.
+/// Shell scripts support single quotes, double quotes, and unquoted text,
+/// each with different escaping and expansion rules.
 #[derive(Clone, Debug)]
 enum QuoteMode {
+    /// Not inside any quotes - expansions and operators are recognized
     None,
+    /// Inside single quotes - all characters are literal except the closing quote
     Single(SourcePosition),
+    /// Inside double quotes - variable/command substitution occurs, but most operators are literal
     Double(SourcePosition),
 }
 
+/// Tracks the state of here-document parsing.
+/// Here-documents are a complex feature where input is redirected from a multi-line
+/// block that follows the command, terminated by a matching tag.
+/// Example: cat <<EOF\nHello World\nEOF
 #[derive(Clone, Debug, Default)]
 enum HereState {
     /// In this state, we are not currently tracking any here-documents.
     #[default]
     None,
     /// In this state, we expect that the next token will be a here tag.
+    /// The remove_tabs flag indicates if leading tabs should be stripped (<<- operator).
     NextTokenIsHereTag { remove_tabs: bool },
     /// In this state, the *current* token is a here tag.
+    /// We store the operator token to emit it later along with the body.
     CurrentTokenIsHereTag {
         remove_tabs: bool,
         operator_token_result: TokenizeResult,
@@ -200,13 +212,22 @@ enum HereState {
     InHereDocs,
 }
 
+/// Represents a here-document tag and its associated state.
+/// Here-documents can appear in any order but their bodies must appear
+/// in the same order as their tags after the newline.
 #[derive(Clone, Debug)]
 struct HereTag {
+    /// The tag string that terminates the here-document body
     tag: String,
+    /// Whether the tag contained quotes or escapes (affects variable expansion in the body)
     tag_was_escaped_or_quoted: bool,
+    /// Whether leading tabs should be removed from each line (<<- vs <<)
     remove_tabs: bool,
+    /// Source position where this here-tag was defined
     position: SourcePosition,
+    /// Tokens associated with this here-document (operator and tag tokens)
     tokens: Vec<TokenizeResult>,
+    /// Tokens that appeared after this tag but before the body starts
     pending_tokens_after: Vec<TokenizeResult>,
 }
 
@@ -247,6 +268,20 @@ impl Default for TokenizerOptions {
 }
 
 /// A tokenizer for shell scripts.
+/// 
+/// The tokenizer implements the lexical analysis phase of shell parsing.
+/// It reads raw input text and breaks it into tokens (words and operators)
+/// while handling complex shell features like:
+/// 
+/// - Quoting and escaping (single quotes, double quotes, backslash)
+/// - Variable expansion ($var, ${var}, $(command), $((arithmetic)))
+/// - Here-documents (<<EOF, <<-EOF with leading tab removal)
+/// - Command substitution (backticks and $(...))
+/// - Extended globbing patterns (@(...), !(...), etc.)
+/// - Context-sensitive operator parsing (| vs || vs |&)
+/// 
+/// The tokenizer maintains state across multiple tokens to handle
+/// multi-token constructs like here-documents correctly.
 pub(crate) struct Tokenizer<'a, R: ?Sized + std::io::BufRead> {
     char_reader: std::iter::Peekable<utf8_chars::Chars<'a, R>>,
     cross_state: CrossTokenParseState,
@@ -329,13 +364,21 @@ impl TokenParseState {
         self.token_so_far = s;
     }
 
+    /// Finalizes the current token and handles here-document state transitions.
+    /// This is a complex function that manages the here-document parsing state machine,
+    /// which must track multiple here-documents that can be nested and interleaved.
+    /// 
+    /// The here-document parsing involves several states:
+    /// 1. Operator parsed (<<) -> expect here-tag next
+    /// 2. Here-tag parsed -> expect newline, then body
+    /// 3. Body lines parsed -> look for terminating tag
+    /// 4. Terminating tag found -> emit collected tokens
     pub fn delimit_current_token(
         &mut self,
         reason: TokenEndReason,
         cross_token_state: &mut CrossTokenParseState,
     ) -> Result<Option<TokenizeResult>, TokenizerError> {
-        // If we don't have anything in the token, then don't yield an empty string token
-        // *unless* it's the body of a here document.
+        // Don't emit empty tokens unless it's a here-document body ending
         if !self.started_token() && !matches!(reason, TokenEndReason::HereDocumentBodyEnd) {
             return Ok(Some(TokenizeResult {
                 reason,
@@ -343,7 +386,8 @@ impl TokenParseState {
             }));
         }
 
-        // TODO: Make sure the here-tag meets criteria (and isn't a newline).
+        // Handle here-document state transitions
+        // This is complex because multiple here-docs can be on one line: cmd <<EOF1 <<EOF2
         let current_here_state = std::mem::take(&mut cross_token_state.here_state);
         match current_here_state {
             HereState::NextTokenIsHereTag { remove_tabs } => {
@@ -595,6 +639,10 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
     /// Returns the next token from the input stream, optionally stopping early when a specified
     /// terminating character is encountered.
     ///
+    /// This is the core tokenization function that implements the shell lexical analysis.
+    /// It handles complex features like here-documents, quotes, escaping, command substitution,
+    /// and variable expansion while maintaining proper tokenization state.
+    ///
     /// # Arguments
     ///
     /// * `terminating_char` - An optional character that, if encountered, will stop the
@@ -675,21 +723,21 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                     &mut self.cross_state,
                 )?;
             //
-            // Handle being in a here document.
+            // Handle being in a here document body.
+            // Here-documents consume all characters literally until the terminating tag is found.
             //
             } else if matches!(self.cross_state.here_state, HereState::InHereDocs) {
-                //
-                // For now, just include the character in the current token. We also check
-                // if there are leading tabs to be removed.
-                //
+                // Handle tab removal for <<- operator: remove leading tabs at start of lines
+                // when the here-document was created with <<- instead of <<
                 if !self.cross_state.current_here_tags.is_empty()
                     && self.cross_state.current_here_tags[0].remove_tabs
                     && (!state.started_token() || state.current_token().ends_with('\n'))
                     && c == '\t'
                 {
-                    // Consume it but don't include it.
+                    // Consume the tab but don't include it in the token (<<- behavior)
                     self.consume_char()?;
                 } else {
+                    // Include all other characters in the here-document body
                     self.consume_char()?;
                     state.append_char(c);
 
@@ -814,41 +862,47 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 state.in_escape = false;
                 self.consume_char()?;
                 state.append_char(c);
+            //
+            // Handle expansion and command substitution characters ($, `)
+            // These are recognized in unquoted text and inside double quotes
+            //
             } else if (state.unquoted()
                 || (matches!(state.quote_mode, QuoteMode::Double(_)) && !state.in_escape))
                 && (c == '$' || c == '`')
             {
                 // TODO: handle quoted $ or ` in a double quote
                 if c == '$' {
-                    // Consume the '$' so we can peek beyond.
+                    // Parse variable expansion or command substitution
+                    // Consume the '$' so we can peek at what follows
                     self.consume_char()?;
 
-                    // Now peek beyond to see what we have.
+                    // Determine what type of expansion this is based on the next character
                     let char_after_dollar_sign = self.peek_char()?;
                     match char_after_dollar_sign {
                         Some('(') => {
+                            // Command substitution: $(...) or arithmetic expansion: $((...))
                             // Add the '$' we already consumed to the token.
                             state.append_char('$');
 
                             // Consume the '(' and add it to the token.
                             state.append_char(self.next_char()?.unwrap());
 
-                            // Check to see if this is possibly an arithmetic expression
-                            // (i.e., one that starts with `$((`).
+                            // Check if this is arithmetic expansion $((...)) vs command substitution $(...)
+                            // Both start with $( but arithmetic has double parentheses
                             let mut required_end_parens = 1;
                             if matches!(self.peek_char()?, Some('(')) {
+                                // This is arithmetic expansion: $((expression))
                                 // Consume the second '(' and add it to the token.
                                 state.append_char(self.next_char()?.unwrap());
-                                // Keep track that we'll need to see *2* end parentheses
-                                // to leave this construct.
+                                // Track that we need 2 closing parens to end this construct
                                 required_end_parens = 2;
-                                // Keep track that we're in an arithmetic expression, since
-                                // some text will be interpreted differently as a result
-                                // (e.g., << is a left shift operator and not a here doc
-                                // input redirection operator).
+                                // Flag that we're in arithmetic mode - this affects operator parsing
+                                // (e.g., << is left-shift, not here-doc redirection)
                                 self.cross_state.arithmetic_expansion = true;
                             }
 
+                            // Handle here-documents within command substitution
+                            // These need special handling since they span multiple tokens
                             let mut pending_here_doc_tokens = vec![];
                             let mut drain_here_doc_tokens = false;
 
@@ -1169,6 +1223,16 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
         matches!(c, '&' | '(' | ')' | ';' | '\n' | '|' | '<' | '>')
     }
 
+    /// Determines if a string represents a valid shell operator.
+    /// 
+    /// Shell operators include:
+    /// - Redirection: <, >, <<, >>, <&, >&, <>, >|, etc.
+    /// - Pipes: |, || (logical OR), |& (pipe stderr too - bash extension) 
+    /// - Control: &, && (logical AND), ;, ;; (case terminator)
+    /// - Grouping: (, )
+    /// - Special: newline (command terminator)
+    /// 
+    /// Some operators are bash/non-POSIX extensions and are controlled by sh_mode flag.
     fn is_operator(&self, s: &str) -> bool {
         // Handle non-POSIX operators.
         if !self.options.sh_mode && matches!(s, "<<<" | "&>" | "&>>" | ";;&" | ";&" | "|&") {
@@ -1217,6 +1281,16 @@ fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
 }
 
+/// Determines if a character affects the quoting state given the current parsing context.
+/// 
+/// Shell quoting has complex rules that depend on the current quote mode:
+/// - Outside quotes: backslash, single quote, and double quote all start escaping/quoting
+/// - Inside single quotes: nothing can escape or change quoting (not even backslash)
+/// - Inside double quotes: only backslash can escape (and only certain characters)
+/// - After backslash: the next character is always treated literally
+/// 
+/// This function implements these rules to help the tokenizer determine when
+/// quote mode transitions should occur.
 fn does_char_newly_affect_quoting(state: &TokenParseState, c: char) -> bool {
     // If we're currently escaped, then nothing affects quoting.
     if state.in_escape {

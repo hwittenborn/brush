@@ -156,6 +156,15 @@ impl AndOrList {
 
 /// Represents a boolean operator used to connect command pipelines, along with the
 /// succeeding pipeline.
+/// 
+/// In shell syntax, these operators provide conditional execution:
+/// - `&&` (AND): Execute the following command only if the previous succeeded (exit code 0)
+/// - `||` (OR): Execute the following command only if the previous failed (exit code != 0)
+/// 
+/// Examples:
+/// - `cmd1 && cmd2` - run cmd2 only if cmd1 succeeds
+/// - `cmd1 || cmd2` - run cmd2 only if cmd1 fails  
+/// - `cmd1 && cmd2 || cmd3` - run cmd2 if cmd1 succeeds, otherwise run cmd3
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "fuzz-testing", derive(arbitrary::Arbitrary))]
 #[cfg_attr(test, derive(PartialEq, Eq, serde::Serialize))]
@@ -258,6 +267,17 @@ impl Display for Command {
 }
 
 /// Represents a compound command, potentially made up of multiple nested commands.
+/// 
+/// Compound commands are complex constructs that group simpler commands together.
+/// They include control flow structures (if, while, for), command grouping ({ }, ( )),
+/// and bash extensions like arithmetic evaluation (( )).
+/// 
+/// Examples:
+/// - `{ cmd1; cmd2; }` - brace group (executes in current shell)
+/// - `( cmd1; cmd2 )` - subshell (executes in new shell process)  
+/// - `if condition; then action; fi` - conditional execution
+/// - `for var in list; do action; done` - iteration over values
+/// - `(( expression ))` - arithmetic evaluation (bash extension)
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "fuzz-testing", derive(arbitrary::Arbitrary))]
 #[cfg_attr(test, derive(PartialEq, Eq, serde::Serialize))]
@@ -435,7 +455,16 @@ impl Display for CaseClauseCommand {
     }
 }
 
-/// A sequence of commands.
+/// Represents a compound list of commands.
+/// 
+/// A compound list is a sequence of and-or lists (command pipelines with boolean operators)
+/// separated by command separators (semicolon or ampersand).
+/// This is the core structure for representing multiple commands in sequence.
+/// 
+/// Examples:
+/// - `cmd1; cmd2` - two commands in sequence
+/// - `cmd1 && cmd2; cmd3 &` - conditional execution followed by background execution
+/// - `cmd1 | cmd2 || cmd3; cmd4` - pipeline with fallback, then another command
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "fuzz-testing", derive(arbitrary::Arbitrary))]
 #[cfg_attr(test, derive(PartialEq, Eq, serde::Serialize))]
