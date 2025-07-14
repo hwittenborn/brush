@@ -216,6 +216,11 @@ impl<'a> peg::ParseSlice<'a> for Tokens<'a> {
                     result.push_str(s);
                     last_token_was_word = true;
                 }
+                Token::Comment(s, _) => {
+                    // Include comments in the parsed slice
+                    result.push_str(s);
+                    last_token_was_word = false;
+                }
             }
         }
 
@@ -712,20 +717,24 @@ peg::parser! {
             specific_operator(">") s:subshell() { (ast::ProcessSubstitutionKind::Write, s) }
 
         rule newline_list() -> () =
-            newline()+ {}
+            (newline() / comment())+ {}
 
         rule linebreak() -> () =
             quiet! {
-                newline()* {}
+                (newline() / comment())* {}
             }
 
+        rule comment() -> () = quiet! {
+            [Token::Comment(_, _)] {}
+        }
+
         rule separator_op() -> ast::SeparatorOperator =
-            specific_operator("&") { ast::SeparatorOperator::Async } /
-            specific_operator(";") { ast::SeparatorOperator::Sequence }
+            comment()* specific_operator("&") { ast::SeparatorOperator::Async } /
+            comment()* specific_operator(";") { ast::SeparatorOperator::Sequence }
 
         rule separator() -> Option<ast::SeparatorOperator> =
             s:separator_op() linebreak() { Some(s) } /
-            newline_list() { None }
+            comment()* newline_list() { None }
 
         rule sequential_sep() -> () =
             specific_operator(";") linebreak() /
@@ -1094,6 +1103,31 @@ for f in A B C; do
             input,
             result: &result
         });
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_program_with_comments() -> Result<()> {
+        let input = r#"# This is a script
+echo "start"
+# Comment in the middle
+echo "middle" # inline comment
+# Final comment
+echo "end""#;
+
+        let tokens = tokenize_str(input)?;
+        let result = super::token_parser::program(
+            &Tokens {
+                tokens: tokens.as_slice(),
+            },
+            &ParserOptions::default(),
+            &SourceInfo::default(),
+        );
+
+        assert!(result.is_ok(), "Parser should handle comments properly: {:?}", result.err());
+        let program = result.unwrap();
+        assert_eq!(program.complete_commands.len(), 3, "Should have 3 echo commands");
 
         Ok(())
     }

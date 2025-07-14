@@ -66,6 +66,8 @@ pub enum Token {
     Operator(String, TokenLocation),
     /// A word token.
     Word(String, TokenLocation),
+    /// A comment token (text following '#' until end of line).
+    Comment(String, TokenLocation),
 }
 
 impl Token {
@@ -74,6 +76,7 @@ impl Token {
         match self {
             Token::Operator(s, _) => s,
             Token::Word(s, _) => s,
+            Token::Comment(s, _) => s,
         }
     }
 
@@ -82,6 +85,7 @@ impl Token {
         match self {
             Token::Operator(_, l) => l,
             Token::Word(_, l) => l,
+            Token::Comment(_, l) => l,
         }
     }
 }
@@ -1128,22 +1132,38 @@ impl<'a, R: ?Sized + std::io::BufRead> Tokenizer<'a, R> {
                 self.consume_char()?;
                 state.append_char(c);
             } else if c == '#' {
-                // Consume the '#'.
+                // Start collecting a comment token
                 self.consume_char()?;
+                state.append_char(c);
 
                 let mut done = false;
                 while !done {
                     done = match self.peek_char()? {
                         Some('\n') => true,
                         None => true,
-                        _ => {
+                        Some(comment_char) => {
                             // Consume the peeked char; it's part of the comment.
                             self.consume_char()?;
+                            state.append_char(comment_char);
                             false
                         }
                     };
                 }
-                // Re-start loop as if the comment never happened.
+                
+                // Create a comment token instead of discarding
+                result = Some(TokenizeResult {
+                    reason: TokenEndReason::Other,
+                    token: Some(Token::Comment(
+                        std::mem::take(&mut state.token_so_far),
+                        TokenLocation {
+                            start: std::mem::take(&mut state.start_position),
+                            end: self.cross_state.cursor.clone(),
+                        }
+                    )),
+                });
+                
+                // Reset state for next token
+                state.start_position = self.cross_state.cursor.clone();
             } else if state.started_token() {
                 // In all other cases where we have an in-progress token, we delimit here.
                 result =
@@ -1317,9 +1337,10 @@ bc",
         )?;
         assert_matches!(
             &tokens[..],
-            [t1 @ Token::Word(..), t2 @ Token::Operator(..)] if
+            [t1 @ Token::Word(..), t2 @ Token::Comment(..), t3 @ Token::Operator(..)] if
                 t1.to_str() == "a" &&
-                t2.to_str() == "\n"
+                t2.to_str() == "#comment" &&
+                t3.to_str() == "\n"
         );
         Ok(())
     }
@@ -1328,8 +1349,30 @@ bc",
     fn tokenize_comment_at_eof() -> Result<()> {
         assert_matches!(
             &tokenize_str(r"a #comment")?[..],
-            [t1 @ Token::Word(..)] if t1.to_str() == "a"
+            [t1 @ Token::Word(..), t2 @ Token::Comment(..)] if 
+                t1.to_str() == "a" &&
+                t2.to_str() == "#comment"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tokenize_multiple_comments() -> Result<()> {
+        let tokens = tokenize_str(
+            r"echo hello # first comment
+# second comment  
+echo world # third comment",
+        )?;
+        
+        // Find all comment tokens
+        let comment_tokens: Vec<&Token> = tokens.iter()
+            .filter(|t| matches!(t, Token::Comment(..)))
+            .collect();
+            
+        assert_eq!(comment_tokens.len(), 3);
+        assert_eq!(comment_tokens[0].to_str(), "# first comment");
+        assert_eq!(comment_tokens[1].to_str(), "# second comment  ");
+        assert_eq!(comment_tokens[2].to_str(), "# third comment");
         Ok(())
     }
 

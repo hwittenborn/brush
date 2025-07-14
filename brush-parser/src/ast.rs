@@ -1325,6 +1325,9 @@ impl From<&tokenizer::Token> for Word {
             tokenizer::Token::Operator(value, _) => Word {
                 value: value.clone(),
             },
+            tokenizer::Token::Comment(value, _) => Word {
+                value: value.clone(),
+            },
         }
     }
 }
